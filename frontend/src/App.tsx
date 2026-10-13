@@ -93,6 +93,8 @@ export default function App() {
 
       setSessionId('')
       setConversationUrl('')
+      setMaxDurationSeconds(null)
+      setMockMode(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to end conversation.')
     } finally {
