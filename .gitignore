@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+backend/.pytest_cache/
+backend/.mypy_cache/
+frontend/node_modules/
+frontend/dist/
+
+*.tsbuildinfo
