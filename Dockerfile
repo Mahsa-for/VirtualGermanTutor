@@ -1,8 +1,8 @@
 FROM node:20-alpine AS frontend-build
 WORKDIR /app/frontend
-COPY frontend/package.json frontend/tsconfig.json frontend/tsconfig.app.json frontend/vite.config.ts frontend/index.html ./
+COPY frontend/package.json frontend/package-lock.json frontend/tsconfig.json frontend/tsconfig.app.json frontend/vite.config.ts frontend/index.html ./
 COPY frontend/src ./src
-RUN npm install && npm run build
+RUN npm ci && npm run build
 
 FROM python:3.11-slim
 WORKDIR /app
