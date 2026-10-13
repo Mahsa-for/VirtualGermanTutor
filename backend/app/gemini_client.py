@@ -38,9 +38,9 @@ class GeminiClient:
             prompt_lines.append(f'{role}: {content}')
 
         prompt = '\n'.join(prompt_lines).strip() or 'Start the tutoring conversation with one short German question.'
-        responses = model.generate_content(prompt, stream=True)
+        responses = await model.generate_content_async(prompt, stream=True)
 
-        for response in responses:
+        async for response in responses:
             text = getattr(response, 'text', '')
             if text:
                 await asyncio.sleep(0)
