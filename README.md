@@ -8,6 +8,9 @@ This repository contains an MVP web app called **My German Tutor**.
 - Avatar conversation: **Tavus Conversational Video**
 - Deployment target: **Google Cloud Run (single service serving frontend + backend)**
 
+For the complete production setup and troubleshooting procedure, see
+[TAVUS_CLOUD_RUN_SETUP.md](TAVUS_CLOUD_RUN_SETUP.md).
+
 > ⚠️ This environment could not access external docs hosts during implementation, so the Tavus session-creation/end request details are intentionally driven by environment variables (`TAVUS_SESSION_CREATE_URL`, `TAVUS_SESSION_END_URL_TEMPLATE`, `TAVUS_SESSION_PAYLOAD_TEMPLATE`) to avoid hard-coding potentially incorrect API shapes. The app runs end-to-end in **MOCK_MODE** by default.
 
 ---

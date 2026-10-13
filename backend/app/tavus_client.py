@@ -45,7 +45,7 @@ class TavusClient:
         )
 
         headers = {
-            'Authorization': 'Bearer ' + self.settings.tavus_api_key,
+            'x-api-key': self.settings.tavus_api_key,
             'Content-Type': 'application/json',
         }
 
@@ -78,7 +78,7 @@ class TavusClient:
             raise RuntimeError('Set TAVUS_SESSION_END_URL_TEMPLATE from Tavus documentation.')
 
         url = self.settings.tavus_session_end_url_template.format(session_id=session_id)
-        headers = {'Authorization': 'Bearer ' + self.settings.tavus_api_key}
+        headers = {'x-api-key': self.settings.tavus_api_key}
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(url, headers=headers)
