@@ -1,28 +1,28 @@
-import json
+import threading
 import time
-import uuid
 from collections import defaultdict, deque
-from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
 from .config import Settings, get_settings
-from .gemini_client import GeminiClient
 from .models import (
+    FeedbackResponse,
     SessionCreateRequest,
     SessionCreateResponse,
     SessionEndRequest,
-    TavusChatCompletionRequest,
+    SetupRequest,
+    SetupStatusResponse,
 )
+from .provisioning import run_setup
+from .state import STATE
 from .tavus_client import TavusClient
-from .tutor import build_tutor_instruction
 
-app = FastAPI(title='My German Tutor API', version='0.1.0')
+app = FastAPI(title='Virtual German Tutor API', version='1.0.0')
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,6 +33,18 @@ app.add_middleware(
 )
 
 _rate_bucket: dict[str, deque[float]] = defaultdict(deque)
+_setup_lock = threading.Lock()
+
+_MOCK_FEEDBACK = [
+    {
+        'error': 'Ich habe nach Hause gegangen.',
+        'correction': 'Ich bin nach Hause gegangen.',
+        'rule': 'Perfekt with sein (movement)',
+        'explanation': 'Verbs of movement form the Perfekt with "sein", not "haben".',
+        'reference': '[grammar/verb-conjugation-and-tenses] Verbs of movement use sein.',
+        'utterance': 'Ich habe nach Hause gegangen.',
+    }
+]
 
 
 def get_client_ip(request: Request) -> str:
@@ -59,26 +71,39 @@ def enforce_rate_limit(request: Request, settings: Settings) -> None:
     bucket.append(now)
 
 
-def verify_tavus_auth(
-    authorization: str | None = Header(default=None),
-    settings: Settings = Depends(get_settings),
-) -> None:
-    if settings.mock_mode:
-        return
-    if not settings.tavus_llm_auth_token:
-        raise HTTPException(
-            status_code=500,
-            detail='TAVUS_LLM_AUTH_TOKEN must be configured when MOCK_MODE=false.',
-        )
-
-    expected = 'Bearer ' + settings.tavus_llm_auth_token
-    if authorization != expected:
-        raise HTTPException(status_code=401, detail='Unauthorized Tavus LLM request.')
-
-
 @app.get('/api/health')
 def health(settings: Settings = Depends(get_settings)) -> dict[str, Any]:
-    return {'status': 'ok', 'mock_mode': settings.mock_mode}
+    return {
+        'status': 'ok',
+        'app': 'virtual-german-tutor',
+        'mock_mode': settings.mock_mode,
+        'setup_status': STATE.status,
+        'ready': STATE.ready,
+    }
+
+
+@app.post('/api/setup', response_model=SetupStatusResponse)
+def setup(payload: SetupRequest, settings: Settings = Depends(get_settings)) -> SetupStatusResponse:
+    if settings.mock_mode:
+        # No real provisioning in mock mode — pretend everything is ready.
+        STATE.set_status('ready', 'Mock mode: tutor ready without real keys.')
+        return SetupStatusResponse(**STATE.snapshot())
+
+    with _setup_lock:
+        if STATE.status in ('deploying_model', 'creating_avatar'):
+            raise HTTPException(status_code=409, detail='Setup is already in progress.')
+        STATE.set_status('deploying_model', 'Starting setup…')
+
+    thread = threading.Thread(
+        target=run_setup, args=(payload, settings, STATE), daemon=True
+    )
+    thread.start()
+    return SetupStatusResponse(**STATE.snapshot())
+
+
+@app.get('/api/setup/status', response_model=SetupStatusResponse)
+def setup_status() -> SetupStatusResponse:
+    return SetupStatusResponse(**STATE.snapshot())
 
 
 @app.post('/api/session/create', response_model=SessionCreateResponse)
@@ -89,7 +114,7 @@ async def create_session(
 ) -> SessionCreateResponse:
     enforce_rate_limit(request, settings)
 
-    tavus_client = TavusClient(settings)
+    tavus_client = TavusClient(settings, STATE)
     try:
         session_data = await tavus_client.create_session(payload)
     except Exception as exc:
@@ -108,7 +133,7 @@ async def end_session(
     payload: SessionEndRequest,
     settings: Settings = Depends(get_settings),
 ) -> Response:
-    tavus_client = TavusClient(settings)
+    tavus_client = TavusClient(settings, STATE)
     try:
         await tavus_client.end_session(payload.session_id)
     except Exception as exc:
@@ -116,64 +141,60 @@ async def end_session(
     return Response(status_code=204)
 
 
-@app.post('/api/tavus/llm/chat/completions')
-async def tavus_custom_llm(
-    payload: TavusChatCompletionRequest,
-    settings: Settings = Depends(get_settings),
-    _: None = Depends(verify_tavus_auth),
-) -> StreamingResponse:
-    metadata = payload.metadata or {}
-    level = metadata.get('level', 'A1')
-    topic = metadata.get('topic', 'introducing yourself')
+async def _fetch_feedback(settings: Settings) -> list[dict]:
+    if settings.mock_mode:
+        return _MOCK_FEEDBACK
+    if not STATE.ready or not STATE.modal_url:
+        return []
+    headers = {'Authorization': f'Bearer {STATE.model_api_key}'} if STATE.model_api_key else {}
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(f'{STATE.modal_url}/feedback', headers=headers)
+        resp.raise_for_status()
+        return resp.json().get('items', [])
 
-    if level not in {'A1', 'A2', 'B1'}:
-        level = 'A1'
-    if topic not in {'ordering coffee', 'shopping', 'introducing yourself'}:
-        topic = 'introducing yourself'
 
-    system_instruction = build_tutor_instruction(level, topic)  # type: ignore[arg-type]
-    gemini = GeminiClient(settings)
+@app.get('/api/feedback', response_model=FeedbackResponse)
+async def feedback(settings: Settings = Depends(get_settings)) -> FeedbackResponse:
+    try:
+        items = await _fetch_feedback(settings)
+    except Exception:
+        items = []
+    return FeedbackResponse(items=items)
 
-    async def stream() -> AsyncGenerator[str, None]:
-        created = int(time.time())
-        completion_id = f'chatcmpl-{uuid.uuid4().hex}'
 
-        async for text_chunk in gemini.stream_reply(
-            [m.model_dump() for m in payload.messages],
-            system_instruction,
-        ):
-            message = {
-                'id': completion_id,
-                'object': 'chat.completion.chunk',
-                'created': created,
-                'model': settings.gemini_model,
-                'choices': [
-                    {
-                        'index': 0,
-                        'delta': {'content': text_chunk},
-                        'finish_reason': None,
-                    }
-                ],
-            }
-            yield f'data: {json.dumps(message)}\n\n'
+@app.get('/api/feedback/summary')
+async def feedback_summary(settings: Settings = Depends(get_settings)) -> PlainTextResponse:
+    try:
+        items = await _fetch_feedback(settings)
+    except Exception:
+        items = []
 
-        final_chunk = {
-            'id': completion_id,
-            'object': 'chat.completion.chunk',
-            'created': created,
-            'model': settings.gemini_model,
-            'choices': [
-                {
-                    'index': 0,
-                    'delta': {},
-                    'finish_reason': 'stop',
-                }
-            ],
-        }
-        yield f'data: {json.dumps(final_chunk)}\n\n'
-        yield 'data: [DONE]\n\n'
+    lines = ['# Your German feedback summary', '']
+    if not items:
+        lines.append('No mistakes were recorded in this session. Gut gemacht!')
+    else:
+        lines.append(f'You made {len(items)} correction(s) to review:')
+        lines.append('')
+        for i, item in enumerate(items, 1):
+            lines.append(f'## {i}. {item.get("rule", "Correction")}')
+            if item.get('utterance'):
+                lines.append(f'- You said: *{item["utterance"]}*')
+            if item.get('error'):
+                lines.append(f'- Issue: {item["error"]}')
+            if item.get('correction'):
+                lines.append(f'- Correct form: **{item["correction"]}**')
+            if item.get('explanation'):
+                lines.append(f'- Why: {item["explanation"]}')
+            if item.get('reference'):
+                lines.append(f'- Reference: {item["reference"]}')
+            lines.append('')
 
-    return StreamingResponse(stream(), media_type='text/event-stream')
+    document = '\n'.join(lines)
+    return PlainTextResponse(
+        content=document,
+        media_type='text/markdown',
+        headers={'Content-Disposition': 'attachment; filename="german-feedback.md"'},
+    )
 
 
 @app.exception_handler(HTTPException)
@@ -184,6 +205,8 @@ async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / 'frontend' / 'dist'
 
 if FRONTEND_DIST.exists():
+    from fastapi.staticfiles import StaticFiles
+
     app.mount('/assets', StaticFiles(directory=FRONTEND_DIST / 'assets'), name='assets')
 
     @app.get('/')

@@ -1,96 +1,67 @@
-import json
-from collections.abc import Mapping
 from typing import Any
 
 import httpx
 
 from .config import Settings
+from .german_tutor import scenario_context
 from .models import SessionCreateRequest
-from .tutor import build_tutor_instruction
+from .state import RuntimeState
 
 
 class TavusClient:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, state: RuntimeState) -> None:
         self.settings = settings
+        self.state = state
 
     async def create_session(self, request: SessionCreateRequest) -> dict[str, Any]:
         if self.settings.mock_mode:
             return {
-                'session_id': f'mock-{request.level.lower()}-{request.topic.replace(" ", "-")}',
+                'session_id': f'mock-{request.scenario}',
                 'conversation_url': 'https://example.com/mock-tavus-session',
             }
 
-        if not self.settings.tavus_api_key:
-            raise RuntimeError('TAVUS_API_KEY is required when MOCK_MODE=false.')
-        if not self.settings.tavus_session_create_url:
-            raise RuntimeError('Set TAVUS_SESSION_CREATE_URL from Tavus documentation.')
-        if not self.settings.tavus_session_payload_template:
-            raise RuntimeError(
-                'Set TAVUS_SESSION_PAYLOAD_TEMPLATE to the exact JSON body required by your Tavus account. '
-                'Use placeholders: {level}, {topic}, {instructions}, {llm_endpoint}, {max_duration_seconds}.'
-            )
+        if not self.state.ready:
+            raise RuntimeError('Tutor is not set up yet. Add your Modal and Tavus keys first.')
 
-        instruction = build_tutor_instruction(request.level, request.topic)
-        llm_endpoint = f'{self.settings.public_base_url.rstrip("/")}/api/tavus/llm/chat/completions'
-
-        payload = self._build_payload(
-            self.settings.tavus_session_payload_template,
-            {
-                'level': request.level,
-                'topic': request.topic,
-                'instructions': instruction,
-                'llm_endpoint': llm_endpoint,
-                'max_duration_seconds': str(self.settings.tavus_max_duration_seconds),
-            },
+        context = (
+            f'{scenario_context(request.scenario)} '
+            f"The learner's level is {request.level}."
         )
 
-        headers = {
-            'x-api-key': self.settings.tavus_api_key,
-            'Content-Type': 'application/json',
+        payload: dict[str, Any] = {
+            'persona_id': self.state.persona_id,
+            'conversation_name': f'German tutor — {request.scenario}',
+            'conversational_context': context,
+            'properties': {
+                'max_call_duration': self.settings.tavus_max_duration_seconds,
+                'participant_left_timeout': 10,
+                'participant_absent_timeout': 120,
+            },
         }
+        if self.state.replica_id:
+            payload['replica_id'] = self.state.replica_id
 
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(self.settings.tavus_session_create_url, json=payload, headers=headers)
+        headers = {'x-api-key': self.state.tavus_api_key, 'Content-Type': 'application/json'}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                self.settings.tavus_session_create_url, json=payload, headers=headers
+            )
             response.raise_for_status()
             data = response.json()
 
         session_id = data.get('conversation_id') or data.get('session_id') or data.get('id')
         conversation_url = data.get('conversation_url') or data.get('url')
-
         if not session_id or not conversation_url:
-            raise RuntimeError(
-                'Unexpected Tavus response. Verify your payload template and response mapping fields '
-                '(conversation_id/session_id/id and conversation_url/url).'
-            )
+            raise RuntimeError(f'Unexpected Tavus conversation response: {data}')
 
-        return {
-            'session_id': session_id,
-            'conversation_url': conversation_url,
-        }
+        return {'session_id': str(session_id), 'conversation_url': str(conversation_url)}
 
     async def end_session(self, session_id: str) -> None:
         if self.settings.mock_mode:
             return
 
-        if not self.settings.tavus_api_key:
-            raise RuntimeError('TAVUS_API_KEY is required when MOCK_MODE=false.')
-        if not self.settings.tavus_session_end_url_template:
-            raise RuntimeError('Set TAVUS_SESSION_END_URL_TEMPLATE from Tavus documentation.')
-
         url = self.settings.tavus_session_end_url_template.format(session_id=session_id)
-        headers = {'x-api-key': self.settings.tavus_api_key}
-
+        headers = {'x-api-key': self.state.tavus_api_key}
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(url, headers=headers)
             response.raise_for_status()
-
-    @staticmethod
-    def _build_payload(template: str, values: Mapping[str, str]) -> dict[str, Any]:
-        try:
-            rendered = template.format_map(values)
-            payload = json.loads(rendered)
-            if not isinstance(payload, dict):
-                raise ValueError('payload must be an object')
-            return payload
-        except Exception as exc:  # pragma: no cover - explicit configuration error path
-            raise RuntimeError(f'Invalid TAVUS_SESSION_PAYLOAD_TEMPLATE: {exc}') from exc

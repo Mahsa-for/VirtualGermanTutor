@@ -13,6 +13,9 @@ COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
 COPY backend ./backend
+# Needed so the backend can `modal deploy` to the user's account at runtime.
+COPY modal_app ./modal_app
+COPY content ./content
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
 EXPOSE 8080
